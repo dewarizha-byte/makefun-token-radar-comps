@@ -1,12 +1,14 @@
-// A working token-radar-01 entry (Node 22, standard library only) — comps-radar-2.
+// A working token-radar-01 entry (Node 22, standard library only) — comps-radar-4.
 //
 // Pipeline, in order:
 //   1. Resolve the sealed snapshot (/input/snapshot.json, or --input <file|dir>) and the output
 //      directory (--output <dir>, or MAKEFUN_OUTPUT_DIR, or /output).
-//   2. Score every pre-token protocol with the comps model in lib/model.ts.
-//   3. Validate the board's own output shape (positive implied values, non-empty farm plans)
-//      and run the gate's boardIssue checks.
-//   4. Write board.json and data.js, copy dashboard/ and screenshots/, write dossier.json last.
+//   2. Score every protocol with the v4 model in lib/model.ts (fitted regression + comps blend).
+//   3. Validate the board's own output shape (positive implied values, non-empty farm plans).
+//   4. Assert full coverage: every protocol ranked in board.json or carrying a skip-reason.
+//   5. Run the gate's boardIssue checks.
+//   6. Write board.json (rows + skips) and data.js, copy dashboard/ and screenshots/,
+//      write dossier.json last.
 //
 // The dashboard is a static page, no framework and no network: dashboard/index.html,
 // dashboard/app.css and dashboard/app.js read /output/data.js, which this program writes
@@ -15,7 +17,7 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, coverageIssue, dataScript, parseSnapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -50,7 +52,7 @@ const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
 // ---------------------------------------------------------------------------
 
 const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
-const { board, radar } = buildRadar(snapshot);
+const { board, skipped, radar } = buildRadar(snapshot);
 
 // Validation pass: before anything is written, assert the model's own output shape — every row
 // must carry a positive, finite implied_value_usd and a non-empty farm plan. The gate (boardIssue)
@@ -67,6 +69,9 @@ const { board, radar } = buildRadar(snapshot);
     if (!Array.isArray(row.farm_steps) || row.farm_steps.length === 0) {
       issues.push(`farm_steps=${JSON.stringify(row.farm_steps)}`);
     }
+    if (typeof row.net_cost_usd !== 'number' || !(row.net_cost_usd > 0)) {
+      issues.push(`net_cost_usd=${row.net_cost_usd}`);
+    }
     if (issues.length > 0) {
       process.stderr.write(`comps radar: ${row.slug}: ${issues.join('; ')}\n`);
       bad += 1;
@@ -78,9 +83,21 @@ const { board, radar } = buildRadar(snapshot);
   }
   const lowRisk = board.filter((r) => r.risk === 'low').length;
   process.stdout.write(
-    `comps radar: validation ok — ${board.length} rows, all with a positive implied_value_usd and ${board.reduce((n, r) => n + r.farm_steps.length, 0)} farm steps ` +
+    `comps radar: validation ok — ${board.length} rows, all with a positive implied_value_usd, a positive net cost and ${board.reduce((n, r) => n + r.farm_steps.length, 0)} farm steps ` +
       `(risk: ${lowRisk} low / ${board.length - lowRisk} medium+high)\n`,
   );
+}
+
+// Coverage assert: every one of the snapshot's protocols must be accounted for — ranked on the
+// board or carrying an explicit skip-reason. A board that silently drops protocols cannot be
+// audited, so this fails the run rather than writing an incomplete board.
+{
+  const cov = coverageIssue(board, skipped, snapshot);
+  if (cov !== null) {
+    process.stderr.write(`comps radar: coverage assert failed: ${cov}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`comps radar: coverage ok — ${board.length} ranked + ${skipped.length} skipped = ${board.length + skipped.length} of ${snapshot.protocols.length} protocols accounted for\n`);
 }
 
 // The gate's own checks: coverage of the watchlist, rank order, and byte/step limits.
@@ -95,7 +112,7 @@ if (issue !== null) {
 // ---------------------------------------------------------------------------
 
 mkdirSync(out, { recursive: true });
-writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
+writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board, skipped })}\n`);
 writeFileSync(join(out, 'data.js'), dataScript(radar));
 
 /** Copy one directory's regular files into `to`, skipping names that start with a dot. */
@@ -130,10 +147,12 @@ for (const name of shots) {
 writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } }));
 
 // ---------------------------------------------------------------------------
-// Section 4: the run's summary on stdout.
+// Section 4: the run's summary on stdout — the held-out evidence in one line.
 // ---------------------------------------------------------------------------
 
+const k = radar.kpis;
 process.stdout.write(
   `comps radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
+    `comps radar: held-out — anchors ${k.anchors}, LOO MAPE ${(k.loo_mape * 100).toFixed(1)}%, LOO R2 ${k.loo_r2.toFixed(3)}, walk-forward median ratio ${k.wf_median_ratio.toFixed(3)} (train ${radar.held_out.wf_train_n}/test ${radar.held_out.wf_test_n})\n` +
     `comps radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

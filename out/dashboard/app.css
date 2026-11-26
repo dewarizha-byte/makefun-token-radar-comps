@@ -1,4 +1,4 @@
-/* Comps Radar — dark instrument theme. Custom palette, hairline grid, tabular numerals.
+/* Comps Radar v4 — dark instrument theme. Custom palette, hairline grid, tabular numerals.
    The five palette values, two radii and two families are the whole style; everything else
    is spacing, a hairline and a type step.
 
@@ -6,12 +6,14 @@
      1. Design tokens (:root)        — palette, radii, fonts, spacing scale.
      2. Base & accessibility         — body, headings, focus, skip link.
      3. Shell, header, lede          — page frame, brand row, headline + fact list.
-     4. Category legend              — the color legend app.js renders under the lede.
-     5. Controls                     — search, category filter, token-status tabs.
-     6. Tables & badges              — board/live tables, implied bars, risk pills.
-     7. Model panel & empty state    — the formula panel and the no-match panel.
-     8. Detail drawer                — the per-protocol dialog.
-     9. Responsive & motion          — small screens and reduced-motion. */
+     4. KPI strip                    — the held-out evidence: R2, LOO MAPE, walk-forward
+                                       ratio, coverage x/758, token-odds median, cover check.
+     5. Category legend              — the color legend app.js renders under the lede.
+     6. Controls                     — search, category filter, token-status tabs.
+     7. Tables & badges              — board/live tables, implied bars, intervals, risk pills.
+     8. Model panel & empty state    — the formula panel and the no-match panel.
+     9. Detail drawer                — the per-protocol dialog.
+    10. Responsive & motion          — small screens and reduced-motion. */
 
 /* 1. Design tokens */
 :root {
@@ -86,13 +88,29 @@ a { color: var(--accent); }
 .fact b { font-family: var(--font-num); font-size: 15px; font-weight: 500; }
 .fact span { color: var(--muted); font-size: 13px; }
 
-/* 4. Category legend: the swatches match the per-row category dots. */
+/* 4. KPI strip: the held-out evidence and the cover self-check, one row of tiles. */
+.kpis {
+  display: flex; flex-wrap: wrap; gap: var(--step-3);
+  padding: var(--step-4); border: 1px solid var(--border); border-radius: var(--radius-panel);
+  background: var(--surface);
+}
+.kpi { min-width: 150px; flex: 1; display: grid; gap: 2px; }
+.kpi span { color: var(--muted); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; }
+.kpi b { font-family: var(--font-num); font-size: 18px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.kpi .sub-note { color: var(--muted); font-size: 11px; font-family: var(--font-num); }
+.cover-check {
+  margin-top: var(--step-3); padding-top: var(--step-3); border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 13px; font-family: var(--font-num);
+}
+.cover-check.ok { color: var(--accent); }
+
+/* 5. Category legend: the swatches match the per-row category dots. */
 .legend { display: flex; flex-wrap: wrap; gap: var(--step-2) var(--step-4); align-items: center; margin: var(--step-2) 0 var(--step-3); }
 .legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .legend-swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
 .name .legend-swatch { margin-right: 6px; }
 
-/* 5. Controls */
+/* 6. Controls */
 .controls { display: flex; flex-wrap: wrap; align-items: end; gap: var(--step-3); padding: var(--step-4) 0; border-top: 1px solid var(--border); }
 .field { display: grid; gap: var(--step-1); }
 .field label { color: var(--muted); font-size: 12px; }
@@ -106,7 +124,7 @@ a { color: var(--accent); }
 .tabs button[aria-pressed="true"] { background: var(--accent); color: #0c1210; }
 .count { margin-left: auto; color: var(--muted); font-size: 13px; align-self: center; }
 
-/* 6. Tables & badges */
+/* 7. Tables & badges */
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-panel); overflow: hidden; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -126,6 +144,7 @@ tbody tr[data-selected="true"] { background: var(--accent-dim); }
 .bar { width: 120px; height: 6px; border-radius: 3px; background: rgba(255, 255, 255, 0.07); overflow: hidden; }
 .bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), #7be3b4); }
 .implied { display: flex; align-items: center; gap: var(--step-2); }
+.interval { color: var(--muted); font-size: 11px; font-family: var(--font-num); white-space: nowrap; }
 .risk { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: 11px; font-family: var(--font-num); letter-spacing: 0.03em; text-transform: uppercase; white-space: nowrap; }
 .risk::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .risk.low { color: var(--accent); background: rgba(63, 214, 143, 0.10); }
@@ -134,7 +153,7 @@ tbody tr[data-selected="true"] { background: var(--accent-dim); }
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
 .status::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
 
-/* 7. Model panel & empty state */
+/* 8. Model panel & empty state */
 .model { margin-top: var(--step-4); padding: var(--step-5); display: grid; gap: var(--step-3); }
 .formula { font-family: var(--font-num); font-size: 13px; line-height: 1.7; color: var(--muted); overflow-wrap: anywhere; }
 .empty { padding: var(--step-7) var(--step-5); text-align: center; display: grid; gap: var(--step-3); justify-items: center; }
@@ -142,7 +161,7 @@ tbody tr[data-selected="true"] { background: var(--accent-dim); }
 .button { min-height: 36px; padding: 0 var(--step-4); border: 1px solid var(--border); border-radius: var(--radius-control); background: var(--surface); color: var(--ink); }
 .button.primary { background: var(--accent); border-color: var(--accent); color: #0c1210; }
 
-/* 8. Detail drawer */
+/* 9. Detail drawer */
 .detail {
   position: fixed; top: 0; right: 0; bottom: 0; width: min(520px, 92vw); z-index: 10;
   background: var(--surface); border-left: 1px solid var(--border); padding: var(--step-5);
@@ -167,12 +186,13 @@ tbody tr[data-selected="true"] { background: var(--accent-dim); }
 .steps b { display: block; font-weight: 500; }
 .cost { color: var(--muted); font-size: 12px; font-family: var(--font-num); }
 
-/* 9. Responsive & motion */
+/* 10. Responsive & motion */
 @media (max-width: 900px) {
   .shell { padding: var(--step-4); }
   .lede { grid-template-columns: 1fr; gap: var(--step-4); }
   .facts { border-left: 0; border-top: 1px solid var(--border); padding-left: 0; padding-top: var(--step-4); }
   .field input { min-width: 0; width: 100%; }
+  .kpi { min-width: 120px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }

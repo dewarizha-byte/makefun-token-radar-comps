@@ -1,16 +1,19 @@
-// Comps Radar's plain dashboard. It reads window.RADAR (written beside dashboard/ by main.ts) and
-// renders the ranked board, a filterable table, a per-protocol detail drawer with the model's own
-// inputs and the protocol's farm plan. No network: every byte it shows is in data.js.
+// Comps Radar v4's plain dashboard. It reads window.RADAR (written beside dashboard/ by main.ts)
+// and renders the ranked board with per-row intervals and token odds, a KPI strip of held-out
+// evidence (LOO MAPE, LOO R2, walk-forward ratio, coverage, token-odds median), a cover
+// self-check line, a per-protocol detail drawer with the model's own inputs and the costed farm
+// plan. No network: every byte it shows is in data.js.
 //
 // File sections:
 //   1. Boot & state       — window.RADAR, the filter/sort/selection state.
 //   2. Formatters         — USD, percent, age.
-//   3. Model check        — impliedOf, the page's re-run of the board's arithmetic.
+//   3. Model check        — impliedOf, the page's re-run of the board's blend arithmetic.
 //   4. DOM helper         — el(), the one builder every view uses.
-//   5. Farm plan          — the same derivation main.ts writes to board.json.
+//   5. Farm plan          — the same derivation (incl. net cost) main.ts writes to board.json.
 //   6. URL state          — readHash/writeHash, so filters survive a reload or a share.
 //   7. Filtering & sort   — rows()/sortedRows().
-//   8. Views              — header, lede, category legend, controls, tables, model panel, detail.
+//   8. Views              — header, lede, KPI strip, category legend, controls, tables,
+//                           model panel, detail drawer.
 //   9. Render & boot      — render(), hash read, Escape-to-close.
 
 // ---------------------------------------------------------------------------
@@ -47,20 +50,30 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Section 3: the model in one function. The page recomputes a row from the snapshot figures
-  // and checks the number board.json carries, so the page's code and the board's data are
-  // visibly the same arithmetic.
+  // Section 3: the model in one function. The page recomputes a row's blend from the snapshot
+  // figures and the fitted coefficients carried in data.js, and checks the number board.json
+  // carries — the page's code and the board's data are visibly the same arithmetic.
   // ---------------------------------------------------------------------------
 
-  function impliedOf(row, model) {
-    var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
-    var growthAdj = 1 + (growth / 100) * model.growth_weight;
-    var age = row.age_days === null || row.age_days === undefined ? model.unknown_age_days : row.age_days;
-    var ageAdj = model.age_floor + (Math.min(Math.max(age, 0), model.age_days) / model.age_days) * model.age_range;
-    var chainAdj = model.chain_floor + (Math.min((row.chains || []).length, model.chain_cap) / model.chain_cap) * model.chain_range;
-    var rawGrowth = row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d;
-    var stabilityAdj = 1 - (Math.min(Math.abs(rawGrowth), model.stability_cap) / model.stability_cap) * model.stability_weight;
-    return Math.max(1, Math.round(row.tvl_usd * row.comps_multiple * growthAdj * ageAdj * chainAdj * stabilityAdj));
+  function impliedOf(row) {
+    var reg = DATA.regression;
+    if (!reg) return row.implied_value_usd;
+    var growth = Math.min(Math.abs(row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d), 200);
+    var age = row.age_days === null || row.age_days === undefined ? DATA.model.unknown_age_days : row.age_days;
+    var predLog = reg.b0 + reg.b1 * Math.log10(row.tvl_usd) + reg.b2 * growth + reg.b3 * Math.log10(Math.max(1, age));
+    var growthAdj = 1 + (Math.min(100, Math.max(-50, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d)) / 100) * 0.4;
+    var ageAdj = 0.75 + (Math.min(Math.max(age, 0), DATA.model.age_horizon_days) / DATA.model.age_horizon_days) * 0.5;
+    var chainAdj = 0.9 + (Math.min((row.chains || []).length, 6) / 6) * 0.2;
+    var stabilityAdj = 1 - (Math.min(Math.abs(row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d), 200) / 200) * 0.15;
+    var compsImplied = Math.max(1, row.tvl_usd * row.comps_multiple * growthAdj * ageAdj * chainAdj * stabilityAdj);
+    var compsLog = Math.log10(compsImplied);
+    // Blend in log space with the same shrink weight: w = n_comps/(n_comps+25). The category's
+    // own comps count is not in data.js, but the blend weight the model used is — the page
+    // recovers n from it and re-derives the identical weight.
+    var n = Math.round((row.blend_weight * DATA.model.shrink_k) / Math.max(1e-9, 1 - row.blend_weight));
+    var w = n / (n + DATA.model.shrink_k);
+    var blendLog = w * compsLog + (1 - w) * predLog;
+    return Math.max(1, Math.round(Math.pow(10, blendLog)));
   }
 
   // ---------------------------------------------------------------------------
@@ -90,8 +103,8 @@
 
   // ---------------------------------------------------------------------------
   // Section 5: the farm plan. It is the same derivation main.ts writes to board.json:
-  // category, chains, TVL and age decide the action, the capital, the hold and every cost
-  // and time. No name is special-cased.
+  // category, chains, TVL and age decide the action, the capital, the hold, every cost and
+  // time, and the NET cost per plan (capital + gas + time at $15/hour). No name is special-cased.
   // ---------------------------------------------------------------------------
 
   function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
@@ -101,11 +114,23 @@
     if (p.tvl_usd >= 1e8) return 100;
     return 50;
   }
+  function gasFor(p) {
+    var capital = capitalFor(p);
+    return capital >= 150 ? 14 : capital >= 100 ? 10 : 6;
+  }
   function holdDaysFor(age) {
     if (age === null || age === undefined) return 30;
     if (age < 180) return 60;
     if (age < 365) return 45;
     return 30;
+  }
+  function netCostFor(p) {
+    var capital = capitalFor(p);
+    var gas = gasFor(p);
+    var hold = holdDaysFor(p.age_days);
+    var weeks = Math.max(1, Math.round(hold / 7));
+    var activeMinutes = 15 + 10 + 10 * weeks + 10;
+    return Math.round(capital + gas + (activeMinutes / 60) * 15);
   }
   function actionFor(p, capital, chain) {
     var c = (p.category || '').toLowerCase();
@@ -136,15 +161,18 @@
   function farmSteps(p) {
     var chain = chainOf(p);
     var capital = capitalFor(p);
+    var gas = gasFor(p);
     var hold = holdDaysFor(p.age_days);
+    var weeks = Math.max(1, Math.round(hold / 7));
+    var net = netCostFor(p);
     var risk = p.risk || 'medium';
     return [
       { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
-      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + (capital >= 150 ? 8 : 4) + ' of gas', time: '15 minutes to set up' },
-      { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: 'about $2 of gas a week', time: '10 minutes a week' },
-      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
+      { text: actionFor(p, capital, chain), cost: '$' + capital + ' of capital and about $' + gas + ' of gas for the whole plan', time: '15 minutes to set up' },
+      { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: 'about $2 of gas a week, ' + weeks + ' weeks in this plan', time: '10 minutes a week' },
+      { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position and comes back on exit', time: hold + ' days' },
       { text: "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: riskNote(risk), cost: 'the discipline costs nothing and saves the position', time: 'a read before each top-up' }
+      { text: riskNote(risk), cost: 'NET cost of this plan: about $' + net + ' all-in ($' + capital + ' capital + $' + gas + ' gas + about $' + (net - capital - gas) + ' of time at $15/hour)', time: 'a read before each top-up' }
     ].map(stepText);
   }
 
@@ -191,7 +219,8 @@
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
-      else if (key === 'comps') { av = a.comps_multiple; bv = b.comps_multiple; }
+      else if (key === 'odds') { av = a.token_odds; bv = b.token_odds; }
+      else if (key === 'net') { av = a.net_cost_usd; bv = b.net_cost_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -205,7 +234,7 @@
 
   function header() {
     return el('header', { class: 'top' },
-      el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Comps Radar' })),
+      el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Comps Radar v4' })),
       el('div', { class: 'top-meta' },
         el('span', { text: 'Snapshot ' + DATA.as_of }),
         el('span', { text: 'DefiLlama protocol index' }),
@@ -218,17 +247,38 @@
     var high = DATA.rows.filter(function (r) { return r.risk === 'low'; }).length;
     return el('section', { class: 'lede' },
       el('div', null,
-        el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by comparable-market implied value' }),
-        el('p', { text: 'The implied value is not a fixed multiple: each row is priced at the winsorized median market-cap-to-TVL ratio of the snapshot\'s own live tokens in the same category (' + DATA.model_version + ' model), adjusted for growth, age, chain reach and TVL stability. ' + high + ' rows read as low risk. The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record, plus ' + DATA.early_size + ' early protocols below it. This is a model, not a promise.' })
+        el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by a fitted, held-out-tested model' }),
+        el('p', { text: 'Every row blends a log-space regression fitted on the snapshot\'s ' + DATA.kpis.anchors + ' traded protocols with its category\'s winsorized median market-cap-to-TVL comps (' + DATA.model_version + ' model), the blend leaning on comps where a category has many live tokens and on the fit where it does not. Each row carries a conformal low/high interval from held-out residuals. Every one of the ' + DATA.kpis.coverage_total + ' protocols in the snapshot is accounted for — ranked, or skipped with a stated reason. This is a model, not a promise.' })
       ),
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Protocols skipped, with reasons' }), el('b', { text: String(DATA.skipped.length) })),
         el('div', { class: 'fact' }, el('span', { text: 'Low-risk rows' }), el('b', { text: String(high) })),
         el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
       )
     );
+  }
+
+  // The KPI strip: the held-out evidence, coverage and the cover self-check in one row.
+  function kpiStrip() {
+    var k = DATA.kpis;
+    var ho = DATA.held_out;
+    var cover = DATA.cover_check;
+    var reg = DATA.regression;
+    var tiles = el('div', { class: 'kpis' },
+      el('div', { class: 'kpi' }, el('span', { text: 'LOO R2 (held-out)' }), el('b', { text: k.loo_r2.toFixed(3) }), el('span', { class: 'sub-note', text: k.anchors + ' traded anchors' })),
+      el('div', { class: 'kpi' }, el('span', { text: 'LOO MAPE' }), el('b', { text: (k.loo_mape * 100).toFixed(0) + '%' }), el('span', { class: 'sub-note', text: 'leave-one-out, dollars' })),
+      el('div', { class: 'kpi' }, el('span', { text: 'Walk-forward median ratio' }), el('b', { text: k.wf_median_ratio.toFixed(2) + 'x' }), el('span', { class: 'sub-note', text: 'train ' + ho.wf_train_n + ' / test ' + ho.wf_test_n + ' by listing date' })),
+      el('div', { class: 'kpi' }, el('span', { text: 'Coverage' }), el('b', { text: k.coverage_scored + ' / ' + k.coverage_total }), el('span', { class: 'sub-note', text: 'ranked or skipped with reasons' })),
+      el('div', { class: 'kpi' }, el('span', { text: 'Token-odds median' }), el('b', { text: k.token_odds_median.toFixed(2) }), el('span', { class: 'sub-note', text: 'category traded fraction, age-adjusted' })),
+      el('div', { class: 'kpi' }, el('span', { text: 'Fit b1 (log-tvl)' }), el('b', { text: reg ? reg.b1.toFixed(3) : 'n/a' }), el('span', { class: 'sub-note', text: reg ? 'in-sample R2 ' + reg.r2_in_sample.toFixed(3) : 'no fit' }))
+    );
+    // The cover self-check: one ranked row recomputed from the snapshot figures must equal the
+    // number board.json carries. The line says so explicitly.
+    var line = 'Cover self-check: ' + cover.slug + ' (rank ' + cover.rank + ') recomputed from the snapshot figures = ' + fmtUsd(cover.recomputed_usd) + ', ' +
+      (cover.matches ? 'which matches the ' + fmtUsd(cover.board_usd) + ' board.json carries.' : 'which DOES NOT match the ' + fmtUsd(cover.board_usd) + ' board.json carries — investigate.');
+    return el('section', { class: 'kpi-wrap' }, tiles, el('p', { class: 'cover-check' + (cover.matches ? ' ok' : ''), text: line }));
   }
 
   // A deterministic hue per category so the legend and the rows stay in sync.
@@ -305,11 +355,14 @@
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthClass, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
-        el('td', { class: 'num', text: r.comps_multiple.toFixed(2) + 'x' }),
+        el('td', { class: 'num', text: (r.token_odds * 100).toFixed(0) + '%' }),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
-        )),
+        ),
+          el('span', { class: 'interval', text: 'low ' + fmtUsd(r.interval_low_usd) + ' – high ' + fmtUsd(r.interval_high_usd) })
+        ),
+        el('td', { class: 'num', text: '$' + r.net_cost_usd }),
         el('td', null, el('span', { class: 'risk ' + r.risk, text: r.risk }))
       );
       tbody.appendChild(tr);
@@ -317,15 +370,16 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. Select a row for its comps model and farm plan.' }),
+          el('caption', { class: 'sub', text: 'Pre-token protocols, strongest implied value first. The interval is the conformal low/high band from held-out residuals; net cost is the plan\'s all-in dollar cost. Select a row for its comps model and farm plan.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank'),
             sortHeader('name', 'Protocol'),
             sortHeader('tvl', 'TVL'),
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
-            sortHeader('comps', 'Comps mult'),
-            sortHeader('implied', 'Implied value'),
+            sortHeader('odds', 'Token odds'),
+            sortHeader('implied', 'Implied value + interval'),
+            sortHeader('net', 'Net cost'),
             el('th', { scope: 'col', text: 'Risk' })
           )),
           tbody
@@ -349,7 +403,7 @@
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { class: 'sub', text: 'Token live: these protocols already trade, so their market cap is a fact, not a model. They are set aside from the pre-token ranking.' }),
+          el('caption', { class: 'sub', text: 'Token live: these protocols already trade, so their market cap is a fact, not a model. They trained the regression and are set aside from the pre-token ranking.' }),
           el('thead', null, el('tr', null, el('th', { scope: 'col', text: 'Status' }), el('th', { scope: 'col', text: 'Protocol' }), el('th', { scope: 'col', text: 'TVL' }), el('th', { scope: 'col', text: '7d' }), el('th', { scope: 'col', text: 'Market cap' }), el('th', { scope: 'col', text: 'Token' }))),
           tbody
         )
@@ -359,13 +413,17 @@
 
   function modelPanel() {
     var m = DATA.model;
+    var reg = DATA.regression;
+    var ho = DATA.held_out;
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is priced from the snapshot\'s own live-token market: the winsorized median market-cap-to-TVL ratio of the same category is the comps multiple (the global median where a category has fewer than ' + m.min_comps + ' comps). Winsorizing clips the outer 10% of comps on each side, so one extreme token cannot skew its category\'s multiple. No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'Two branches, one blend. The regression branch: log10(mcap) = b0 + b1*log10(tvl) + b2*|change_7d| + b3*log10(age_days), fitted by ordinary least squares on the snapshot\'s ' + (reg ? reg.n : '—') + ' traded protocols (b0=' + (reg ? reg.b0.toFixed(3) : '—') + ', b1=' + (reg ? reg.b1.toFixed(3) : '—') + ', b2=' + (reg ? reg.b2.toFixed(3) : '—') + ', b3=' + (reg ? reg.b3.toFixed(3) : '—') + '). The comps branch: the category\'s winsorized median mcap/tvl times TVL, with the growth, age, chain and stability adjustments.' }),
       el('div', { class: 'formula' },
-        'implied = round( tvl_usd x comps(category) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.age_floor + ' + min(age_days, ' + m.age_days + ') / ' + m.age_days + ' x ' + m.age_range + ') x (' + m.chain_floor + ' + min(chains, ' + m.chain_cap + ') / ' + m.chain_cap + ' x ' + m.chain_range + ') x (1 - min(|change_7d|, ' + m.stability_cap + ') / ' + m.stability_cap + ' x ' + m.stability_weight + ') )'
+        'blend = 10^( w*log10(comps) + (1-w)*log10(10^(b0 + b1*log10(tvl) + b2*|chg| + b3*log10(age))) )   with  w = n_comps / (n_comps + ' + m.shrink_k + ')\n' +
+        'interval = 10^( blend_log ± q80 )   where q80 = ' + ho.residual_q80_log.toFixed(3) + ' = the 80th percentile of |LOO residual| in log space\n' +
+        'token_odds = traded_fraction(category) + (1 - traded_fraction) x min(age, ' + m.age_horizon_days + ')/' + m.age_horizon_days + ' x 0.5'
       ),
-      el('p', { class: 'sub', text: 'The comps multiple is the only market input: it prices a pre-token protocol the way its own category already trades. Growth rewards momentum; the age term rewards protocols that have run with no token the longest; the chain term rewards reach; the stability term discounts whale-driven TVL swings. An unlisted age uses ' + m.unknown_age_days + ' days. The live-token protocols are set aside with their market caps shown.' })
+      el('p', { class: 'sub', text: 'Held-out evidence: leave-one-out over all ' + ho.loo_n + ' anchors gives a mean absolute percent error of ' + (ho.loo_mape * 100).toFixed(0) + '% and R2 ' + ho.loo_r2.toFixed(3) + ', walk-forward — fit before the median listing date, test after — gives a median actual/predicted ratio of ' + ho.wf_median_ratio.toFixed(2) + 'x (1.0 = perfectly calibrated). The residual interval is computed from held-out errors only. No protocol name is special-cased, and no row is hand-picked.' })
     );
   }
 
@@ -379,7 +437,7 @@
     writeHash();
     dialog.textContent = '';
     var steps = farmSteps(row);
-    var recomputed = impliedOf(row, DATA.model);
+    var recomputed = impliedOf(row);
     var closeEnough = Math.abs(recomputed - row.implied_value_usd) <= Math.max(1, row.implied_value_usd * 0.002);
     dialog.appendChild(el('div', { class: 'detail-head' },
       el('div', null,
@@ -394,19 +452,20 @@
       el('h3', { text: 'Implied value' }),
       el('div', { class: 'equation' },
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
-        el('div', null, el('span', { text: 'Comps multiple (' + row.comps_source + ')' }), el('b', { class: 'num', text: row.comps_multiple.toFixed(4) + 'x' })),
+        el('div', null, el('span', { text: 'Regression prediction (log10)' }), el('b', { class: 'num', text: String(row.pred_log10) })),
+        el('div', null, el('span', { text: 'Comps branch (' + row.comps_source + ')' }), el('b', { class: 'num', text: fmtUsd(Math.pow(10, row.comps_log10)) })),
+        el('div', null, el('span', { text: 'Blend weight (comps)' }), el('b', { class: 'num', text: String(row.blend_weight) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPct(row.change_7d) })),
-        el('div', null, el('span', { text: 'Growth adjust' }), el('b', { class: 'num', text: String(row.growth_adjust) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Age adjust' }), el('b', { class: 'num', text: String(row.age_adjust) })),
-        el('div', null, el('span', { text: 'Chain adjust' }), el('b', { class: 'num', text: String(row.chain_adjust) })),
-        el('div', null, el('span', { text: 'Stability adjust' }), el('b', { class: 'num', text: String(row.stability_adjust) })),
-        el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
+        el('div', null, el('span', { text: 'Token odds' }), el('b', { class: 'num', text: (row.token_odds * 100).toFixed(0) + '%' })),
+        el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) })),
+        el('div', null, el('span', { text: 'Interval low' }), el('b', { class: 'num', text: fmtUsd(row.interval_low_usd) })),
+        el('div', null, el('span', { text: 'Interval high' }), el('b', { class: 'num', text: fmtUsd(row.interval_high_usd) }))
       ),
-      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (closeEnough ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+      el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(recomputed) + (closeEnough ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' The interval is the conformal band from held-out residuals. This is an estimate, not a price.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
-      el('h3', { text: 'Farm plan' }),
+      el('h3', { text: 'Farm plan — net cost $' + row.net_cost_usd }),
       el('ol', { class: 'steps' }, steps.map(function (s) {
         var at = s.indexOf(' Cost: ');
         var action = at >= 0 ? s.slice(0, at) : s;
@@ -430,6 +489,7 @@
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     shell.appendChild(lede());
+    shell.appendChild(kpiStrip());
     shell.appendChild(categoryLegend());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
