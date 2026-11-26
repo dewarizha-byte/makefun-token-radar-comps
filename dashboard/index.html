@@ -1,4 +1,8 @@
 <!doctype html>
+<!-- Comps Radar — the dashboard's static shell.
+     No framework and no network: this page loads app.css for the theme, then ../data.js
+     (written beside dashboard/ by main.ts) which sets window.RADAR, then app.js which
+     renders the whole board, filters, model panel and detail drawer into #board. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -7,8 +11,10 @@
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
+<!-- Skip link for keyboard users; #board is the single render target app.js owns. -->
 <a class="skip" href="#board">Skip to the board</a>
 <main id="board" tabindex="-1" aria-busy="true"></main>
+<!-- ../data.js first (it defines window.RADAR), then app.js (it reads it). -->
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>

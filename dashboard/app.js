@@ -1,6 +1,21 @@
 // Comps Radar's plain dashboard. It reads window.RADAR (written beside dashboard/ by main.ts) and
 // renders the ranked board, a filterable table, a per-protocol detail drawer with the model's own
 // inputs and the protocol's farm plan. No network: every byte it shows is in data.js.
+//
+// File sections:
+//   1. Boot & state       — window.RADAR, the filter/sort/selection state.
+//   2. Formatters         — USD, percent, age.
+//   3. Model check        — impliedOf, the page's re-run of the board's arithmetic.
+//   4. DOM helper         — el(), the one builder every view uses.
+//   5. Farm plan          — the same derivation main.ts writes to board.json.
+//   6. URL state          — readHash/writeHash, so filters survive a reload or a share.
+//   7. Filtering & sort   — rows()/sortedRows().
+//   8. Views              — header, lede, category legend, controls, tables, model panel, detail.
+//   9. Render & boot      — render(), hash read, Escape-to-close.
+
+// ---------------------------------------------------------------------------
+// Section 1: boot & state.
+// ---------------------------------------------------------------------------
 (function () {
   'use strict';
 
@@ -8,6 +23,10 @@
   if (!DATA) return;
   var app = document.getElementById('board');
   var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+
+  // ---------------------------------------------------------------------------
+  // Section 2: formatters.
+  // ---------------------------------------------------------------------------
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -26,8 +45,13 @@
     if (days >= 365) return (days / 365).toFixed(1) + 'y';
     return Math.max(0, Math.round(days)) + 'd';
   }
-  // The model in one function: the page recomputes a row from the snapshot figures and checks the
-  // number board.json carries, so the page's code and the board's data are visibly the same arithmetic.
+
+  // ---------------------------------------------------------------------------
+  // Section 3: the model in one function. The page recomputes a row from the snapshot figures
+  // and checks the number board.json carries, so the page's code and the board's data are
+  // visibly the same arithmetic.
+  // ---------------------------------------------------------------------------
+
   function impliedOf(row, model) {
     var growth = Math.min(model.growth_cap, Math.max(model.growth_floor, row.change_7d === null || row.change_7d === undefined ? 0 : row.change_7d));
     var growthAdj = 1 + (growth / 100) * model.growth_weight;
@@ -38,6 +62,10 @@
     var stabilityAdj = 1 - (Math.min(Math.abs(rawGrowth), model.stability_cap) / model.stability_cap) * model.stability_weight;
     return Math.max(1, Math.round(row.tvl_usd * row.comps_multiple * growthAdj * ageAdj * chainAdj * stabilityAdj));
   }
+
+  // ---------------------------------------------------------------------------
+  // Section 4: the DOM helper.
+  // ---------------------------------------------------------------------------
 
   function el(tag, attrs) {
     var node = document.createElement(tag);
@@ -60,8 +88,12 @@
     return node;
   }
 
-  // The farm plan is the same derivation main.ts writes to board.json: category, chains, TVL and age
-  // decide the action, the capital, the hold and every cost and time. No name is special-cased.
+  // ---------------------------------------------------------------------------
+  // Section 5: the farm plan. It is the same derivation main.ts writes to board.json:
+  // category, chains, TVL and age decide the action, the capital, the hold and every cost
+  // and time. No name is special-cased.
+  // ---------------------------------------------------------------------------
+
   function chainOf(p) { return p.chains && p.chains.length > 0 ? p.chains[0] : 'its main chain'; }
   function capitalFor(p) {
     if (p.tvl_usd >= 5e9) return 250;
@@ -116,6 +148,10 @@
     ].map(stepText);
   }
 
+  // ---------------------------------------------------------------------------
+  // Section 6: URL state.
+  // ---------------------------------------------------------------------------
+
   function readHash() {
     var hash = window.location.hash.replace(/^#/, '');
     if (!hash) return;
@@ -133,6 +169,10 @@
     if (next) window.history.replaceState(null, '', '#' + next);
     else window.history.replaceState(null, '', window.location.pathname + window.location.search);
   }
+
+  // ---------------------------------------------------------------------------
+  // Section 7: filtering & sort.
+  // ---------------------------------------------------------------------------
 
   function rows() {
     var q = state.q.trim().toLowerCase();
@@ -159,6 +199,10 @@
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Section 8: views.
+  // ---------------------------------------------------------------------------
+
   function header() {
     return el('header', { class: 'top' },
       el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { class: 'brand-name', text: 'Comps Radar' })),
@@ -175,7 +219,7 @@
     return el('section', { class: 'lede' },
       el('div', null,
         el('h1', { text: DATA.watchlist_size + ' watchlist protocols, ranked by comparable-market implied value' }),
-        el('p', { text: 'The implied value is not a fixed multiple: each row is priced at the median market-cap-to-TVL ratio of the snapshot\'s own live tokens in the same category (' + DATA.model_version + ' model), adjusted for growth, age, chain reach and TVL stability. ' + high + ' rows read as low risk. The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record, plus ' + DATA.early_size + ' early protocols below it. This is a model, not a promise.' })
+        el('p', { text: 'The implied value is not a fixed multiple: each row is priced at the winsorized median market-cap-to-TVL ratio of the snapshot\'s own live tokens in the same category (' + DATA.model_version + ' model), adjusted for growth, age, chain reach and TVL stability. ' + high + ' rows read as low risk. The watchlist is the floor: every protocol with at least $' + Math.round(DATA.floor_usd / 1e6) + 'M of TVL and no token on record, plus ' + DATA.early_size + ' early protocols below it. This is a model, not a promise.' })
       ),
       el('div', { class: 'facts' },
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
@@ -185,6 +229,23 @@
         el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
       )
     );
+  }
+
+  // A deterministic hue per category so the legend and the rows stay in sync.
+  function categoryHue(name) {
+    var h = 0;
+    for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+    return h;
+  }
+  function categoryLegend() {
+    var categories = Array.from(new Set(DATA.rows.map(function (r) { return r.category || 'Other'; }))).sort();
+    return el('div', { class: 'legend', role: 'list', 'aria-label': 'Category colors' },
+      el('span', { class: 'sub', text: 'Category color' }),
+      categories.map(function (c) {
+        return el('span', { class: 'legend-item', role: 'listitem' },
+          el('i', { class: 'legend-swatch', 'aria-hidden': 'true', style: 'background:hsl(' + categoryHue(c) + ',60%,55%)' }),
+          el('span', { text: c }));
+      }));
   }
 
   function controls() {
@@ -237,6 +298,7 @@
       },
         el('td', { class: 'num', text: String(r.rank) }),
         el('td', null, el('div', { class: 'name' },
+          el('span', { class: 'legend-swatch', 'aria-hidden': 'true', style: 'background:hsl(' + categoryHue(r.category || 'Other') + ',60%,55%)' }),
           el('b', { text: r.name }),
           el('span', { class: 'sub', text: (r.category || 'Other') + ' on ' + (r.chains && r.chains.length ? r.chains.slice(0, 2).join(', ') : 'an unnamed chain') })
         )),
@@ -299,7 +361,7 @@
     var m = DATA.model;
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
-      el('p', { class: 'sub', text: 'Every row is priced from the snapshot\'s own live-token market: the median market-cap-to-TVL ratio of the same category is the comps multiple (the global median where a category has fewer than ' + m.min_comps + ' comps). No protocol name is special-cased, and no row is hand-picked.' }),
+      el('p', { class: 'sub', text: 'Every row is priced from the snapshot\'s own live-token market: the winsorized median market-cap-to-TVL ratio of the same category is the comps multiple (the global median where a category has fewer than ' + m.min_comps + ' comps). Winsorizing clips the outer 10% of comps on each side, so one extreme token cannot skew its category\'s multiple. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x comps(category) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.age_floor + ' + min(age_days, ' + m.age_days + ') / ' + m.age_days + ' x ' + m.age_range + ') x (' + m.chain_floor + ' + min(chains, ' + m.chain_cap + ') / ' + m.chain_cap + ' x ' + m.chain_range + ') x (1 - min(|change_7d|, ' + m.stability_cap + ') / ' + m.stability_cap + ' x ' + m.stability_weight + ') )'
       ),
@@ -359,11 +421,16 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Section 9: render & boot.
+  // ---------------------------------------------------------------------------
+
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
     shell.appendChild(header());
     shell.appendChild(lede());
+    shell.appendChild(categoryLegend());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') shell.appendChild(modelPanel());

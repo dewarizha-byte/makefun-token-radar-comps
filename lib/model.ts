@@ -6,8 +6,8 @@
 //
 // Implied value follows only from the snapshot's own figures — no constant multiplier, no name list:
 //
-//   compsMult  = median(mcap/tvl) of the snapshot's own live-token protocols in the same category
-//                (global median when the category has fewer than 3 comps);
+//   compsMult  = winsorized median(mcap/tvl) of the snapshot's own live-token protocols in the
+//                same category (global median when the category has fewer than 3 comps);
 //   growthAdj  = 1 + clamp(change_7d, -50, +100) / 100 x 0.4;
 //   ageAdj     = 0.75 + min(age_days, 1095) / 1095 x 0.5 (unknown age: 365 days);
 //   chainAdj   = 0.9 + min(chains, 6) / 6 x 0.2 (multi-chain protocols carry more users to convert);
@@ -17,6 +17,19 @@
 //
 // A live-token protocol is never ranked: its market cap is a fact, and the board separates it out.
 // The same function scores every row; nothing is hand-picked.
+//
+// File sections:
+//   1. Types & constants        — snapshot/row interfaces and the model's tunable constants.
+//   2. Small helpers            — finite/age/median/winsorized-median primitives.
+//   3. Comps table              — one winsorized median mcap/tvl per category.
+//   4. Scoring                  — impliedValue, pre-token/rankable tests, risk band, buildBoard.
+//   5. Farm plan                — capital, hold time, per-category action, six steps.
+//   6. Dashboard projections    — live rows, compact radar rows, buildRadar, data.js script.
+//   7. Parsing & gate           — parseSnapshot and the boardIssue checks the scorer mirrors.
+
+// ---------------------------------------------------------------------------
+// Section 1: types & constants.
+// ---------------------------------------------------------------------------
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -176,6 +189,10 @@ export class SnapshotError extends Error {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Section 2: small helpers.
+// ---------------------------------------------------------------------------
+
 const DAY_MS = 86_400_000;
 
 /** A finite number, else `fallback`. */
@@ -192,6 +209,7 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+/** The classic median of a numeric sample. */
 function median(values: number[]): number {
   if (values.length === 0) return 0;
   const s = values.slice().sort((a, b) => a - b);
@@ -199,14 +217,44 @@ function median(values: number[]): number {
   return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
 }
 
-/** The comps table: one median mcap/tvl per category from the snapshot's own live protocols, plus the global median. */
+/**
+ * A winsorized median: the classic median after the outer 10% of values on each side are pulled
+ * in to the 10th/90th percentile. A plain median resists single outliers, but with small comps
+ * sets (5–15 live tokens per category) one or two extreme mcap/tvl ratios (a micro-float token,
+ * a stale TVL) can still skew the middle of the sample; clipping the tails at the 10th/90th
+ * percentile first makes the central estimate much harder to move by one bad comp, without
+ * discarding rows the way a hard trim would when the category has few comps. Tiny samples
+ * (fewer than 5 comps) fall back to the plain median: winsorizing a 2–4 value set would just
+ * flatten real signal into a constant.
+ */
+function winsorizedMedian(values: number[]): number {
+  if (values.length === 0) return 0;
+  if (values.length < 5) return median(values);
+  const s = values.slice().sort((a, b) => a - b);
+  const cut = Math.max(1, Math.floor(s.length * 0.1));
+  const low = s[cut]!;
+  const high = s[s.length - 1 - cut]!;
+  const winsorized = s.map((v) => Math.min(high, Math.max(low, v)));
+  return median(winsorized);
+}
+
+// ---------------------------------------------------------------------------
+// Section 3: the comps table — one winsorized median mcap/tvl per category.
+// ---------------------------------------------------------------------------
+
+/** The comps table: one winsorized median mcap/tvl per category from the snapshot's own live protocols, plus the global median. */
 export function compsTable(snapshot: Snapshot, model: ModelConstants = MODEL): { categories: Map<string, number>; global: number; counts: Map<string, number> } {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
   for (const p of snapshot.protocols) {
+    // A live token's mcap/tvl is one comp. Ratios above 50 are data noise (micro-float caps,
+    // stale TVL), not a valuation signal, and are dropped before any median is taken.
     if (p.mcap_usd === null || p.tvl_usd <= 0) continue;
     const ratio = p.mcap_usd / p.tvl_usd;
-    if (!Number.isFinite(ratio) || ratio <= 0 || ratio > 50) continue;
+    // Refinement on top of winsorizing: a near-zero ratio (token cap under 1% of TVL) is a
+    // stale or dust cap, not a valuation signal — the winsorized median would still drag on it
+    // in a thin category. Drop those before the median, alongside the >50 ceiling.
+    if (!Number.isFinite(ratio) || ratio <= 0 || ratio < 0.01 || ratio > 50) continue;
     all.push(ratio);
     const cat = p.category ?? 'Other';
     const list = byCategory.get(cat);
@@ -215,13 +263,18 @@ export function compsTable(snapshot: Snapshot, model: ModelConstants = MODEL): {
   }
   const categories = new Map<string, number>();
   const counts = new Map<string, number>();
-  const g = median(all);
+  // The global winsorized median is the fallback for any category too thin to price itself.
+  const g = winsorizedMedian(all);
   for (const [cat, list] of byCategory) {
     counts.set(cat, list.length);
-    categories.set(cat, list.length >= model.min_comps ? median(list) : g);
+    categories.set(cat, list.length >= model.min_comps ? winsorizedMedian(list) : g);
   }
   return { categories, global: g, counts };
 }
+
+// ---------------------------------------------------------------------------
+// Section 4: scoring — implied value, rankability, risk, and the ranked board.
+// ---------------------------------------------------------------------------
 
 /** The three multipliers and the implied value one protocol gets under `model`. */
 export interface ImpliedBreakdown {
@@ -310,6 +363,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     const b = impliedValue(p, snapshot.as_of, comps, model);
     return { p, ...b, risk: riskOf(p, b, comps, model) };
   });
+  // Rank by implied value; ties break by slug so the order is deterministic run to run.
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
     rank: i + 1,
@@ -342,6 +396,10 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
 }
 
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+
+// ---------------------------------------------------------------------------
+// Section 5: the farm plan.
+// ---------------------------------------------------------------------------
 
 /** A step as one string: its action, then its cost and time, within the gate's 20..600 characters. */
 export function stepText(step: FarmStep): string {
@@ -439,6 +497,10 @@ export function farmSteps(p: SnapshotProtocol, age: number | null, risk: 'low' |
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Section 6: dashboard projections — live rows, compact rows, the radar, data.js.
+// ---------------------------------------------------------------------------
+
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
   return snapshot.protocols
@@ -501,6 +563,15 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   return { board, radar };
 }
 
+/** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network. */
+export function dataScript(radar: RadarData): string {
+  return `window.RADAR=${JSON.stringify(radar)};\n`;
+}
+
+// ---------------------------------------------------------------------------
+// Section 7: parsing & the gate.
+// ---------------------------------------------------------------------------
+
 /** The snapshot out of a file's text, refused unless it is the shape the model scores. */
 export function parseSnapshot(text: string): Snapshot {
   let raw: unknown;
@@ -562,9 +633,4 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
     if (!Number.isSafeInteger(r.implied_value_usd) || r.implied_value_usd <= 0) return `${r.slug} has implied value ${r.implied_value_usd}`;
   }
   return null;
-}
-
-/** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network. */
-export function dataScript(radar: RadarData): string {
-  return `window.RADAR=${JSON.stringify(radar)};\n`;
 }
